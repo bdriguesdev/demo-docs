@@ -7,16 +7,20 @@ on:
     inputs:
       api_repo:
         description: "owner/repo of the API repo"
-        required: true
+        required: false
         default: ""
       api_ref:
         description: "Commit SHA or branch in the API repo to sync from"
-        required: true
+        required: false
         default: "main"
 
 permissions:
   contents: write
   pull-requests: write
+
+concurrency:
+  group: sync-openapi
+  cancel-in-progress: false
 
 env:
   DEFAULT_API_REPO: ${{ github.repository_owner }}/demo-api
@@ -26,25 +30,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Determine source repo and ref
         id: source
+        env:
+          DISPATCH_REPO: ${{ github.event.client_payload.repo }}
+          DISPATCH_REF: ${{ github.event.client_payload.ref }}
+          INPUT_REPO: ${{ inputs.api_repo }}
+          INPUT_REF: ${{ inputs.api_ref }}
         run: |
-          if [ "${{ github.event_name }}" == "repository_dispatch" ] then
-            echo "repo=${{ github.event.client_payload.repo }}" >> "$GITHUB_OUTPUT"
-            echo "ref=${{ github.event.client_payload.ref }}" >> "GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            REPO="$DISPATCH_REPO"
+            REF="$DISPATCH_REF"
           else
-            REPO="${{ github.events.inputs.api_repo }}"
-            echo "repo=${REPO:-$DEFAULT_API_REPO}" >> "$GITHUB_OUTPUT"
-            echo "ref=${{ github.events.inputs.api_ref }}" >> "$GITHUB_OUTPUT"
+            REPO="$INPUT_REPO"
+            REF="$INPUT_REF"
           fi
 
+          REPO="${REPO:-$DEFAULT_API_REPO}"
+          REF="${REF:-main}"
+
+          if ! printf '%s' "$REPO" | grep -qE '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+            echo "::error::Invalid source repo: '$REPO' (expected owner/repo)"
+            exit 1
+          fi
+
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
       - name: Fetch latest OpenAPI spec and changelog
+        env:
+          SRC_REPO: ${{ steps.source.outputs.repo }}
+          SRC_REF: ${{ steps.source.outputs.ref }}
         run: |
-          SRC_REPO="${{ steps.source.outputs.repo }}"
-          SRC_REF="${{ steps.source.outputs.ref }}"
           echo "Fetching from $SRC_REPO@$SRC_REF"
-          curl -fsSL "https://raw.githubusercontent.com/${SRC_REPO}/openapi.yaml" -o openapi.yaml
-          curl -fsSL "https://raw.githubusercontent.com/${SRC_REPO}/CHANGELOG.md" -o CHANGELOG.md
+          curl -fsSL "https://raw.githubusercontent.com/${SRC_REPO}/${SRC_REF}/openapi.yaml" -o openapi.yaml
+          curl -fsSL "https://raw.githubusercontent.com/${SRC_REPO}/${SRC_REF}/CHANGELOG.md" -o CHANGELOG.md
 
       - name: Check for changes
         id: diff
@@ -54,7 +75,7 @@ jobs:
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
-      
+
       - name: Open PR with the update
         if: steps.diff.outputs.changed == 'true'
         env:
@@ -62,29 +83,28 @@ jobs:
           SRC_REPO: ${{ steps.source.outputs.repo }}
           SRC_REF: ${{ steps.source.outputs.ref }}
         run: |
-          BRANCH="feature/MT-00000-sync-${SRC_REF}"
+          SAFE_REF="$(printf '%s' "$SRC_REF" | tr -c 'A-Za-z0-9._-' '-')"
+          BRANCH="feature/MT-00000-sync-${SAFE_REF}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
           git add openapi.yaml CHANGELOG.md
           git commit -m "Sync OpenAPI spec and changelog from ${SRC_REPO}@${SRC_REF}"
           git push -u origin "$BRANCH" --force
-          
-          cat > /tmp/pr-body.md <<EOF
+
+          cat > "$RUNNER_TEMP/pr-body.md" <<EOF
           Automated sync triggered by a prod deploy in [$SRC_REPO](https://github.com/${SRC_REPO}) at commit \`${SRC_REF}\`.
 
           Please review the diff below and merge to update the live docs site
           EOF
 
           gh pr create \
-            --title "Sync OpenAPI spec and changelog (${SRC_REF})"  \
-            --body-file /tmp/pr-body.md \
+            --title "Sync OpenAPI spec and changelog (${SRC_REF})" \
+            --body-file "$RUNNER_TEMP/pr-body.md" \
             --base main \
-            --head "$BRANCH"
-          || echo "A PR for this branch may already be open - nothing new to create"
+            --head "$BRANCH" \
+            || echo "A PR for this branch may already be open - nothing new to create"
 
       - name: No changes detected
         if: steps.diff.outputs.changed == 'false'
         run: echo "OpenAPI spec and changelog already match the API repo, nothing to sync"
-
-      
